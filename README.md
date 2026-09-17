@@ -8,7 +8,7 @@ Ronin Launchpad 白名单场次直连合约 mint 工具(默认配置为 Yakkamon
 
 1. 安装 [Node.js LTS](https://nodejs.org/)(一路下一步);
 2. 下载本仓库(绿色 Code → Download ZIP,解压);
-3. **双击 `start.bat`**,按提示粘贴私钥、选模式:
+3. **双击 `start.bat`**(macOS/Linux: `bash start.sh`),按提示粘贴私钥、选模式:
    - `[1] 试跑` = 只读模拟,不发交易,验证一切正常;
    - `[2] 实弹` = 到点自动开火(会花 gas,约 0.007 RON)。
 
@@ -153,7 +153,7 @@ $env:MINT_PK="0x..."; node mint.mjs --go
 ```
 mint.mjs        脚本本体(单文件源码,可读、可审计)
 dist/mint.cjs   打包单文件(已内置依赖,免 npm install,node dist/mint.cjs 直接跑)
-start.bat       Windows 双击启动器(试跑/实弹选择)
+start.bat / start.sh  Windows / macOS·Linux 启动器(试跑/实弹选择)
 .env            实际配置(含私钥,勿外传,不进 git)
 .env.example    配置模板
 .gitignore      排除 .env / key.json / node_modules
