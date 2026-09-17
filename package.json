@@ -1,0 +1,17 @@
+{
+  "name": "ronin-launchpad-mint",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ronin Launchpad (MavisLaunchpad) allowlist-stage direct-contract mint bot",
+  "scripts": {
+    "build": "esbuild mint.mjs --bundle --platform=node --format=cjs --outfile=dist/mint.cjs",
+    "start": "node mint.mjs"
+  },
+  "dependencies": {
+    "ethers": "^6.17.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
