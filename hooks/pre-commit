@@ -1,0 +1,50 @@
+#!/bin/sh
+# 提交前私密信息检查(第二层保险)。
+#
+# 本仓库的私有 .env(钱包私钥 + 带 key 的 RPC)由 .gitignore 排除,这道钩子防止
+# `git add -f` 或改名绕过 .gitignore 造成的泄露。
+#
+# 启用: git config core.hooksPath hooks      (本仓库已启用)
+# 确需强行提交: git commit --no-verify
+#
+# 检测规则(只拦真实密钥形状,.env.example 与 README 里的占位示例不会误报):
+#   A. 暂存了名为 .env / .env.* 的文件(除 .env.example)
+#   B. MINT_PK= 后跟 64 位十六进制(真实私钥)
+#   C. 带 key 的私有 RPC 地址(drpc/alchemy/apikey/dwellir/infura)
+
+fail=0
+
+for f in $(git diff --cached --name-only --diff-filter=ACMR); do
+  case "$f" in
+    dist/*|package-lock.json) continue ;;
+  esac
+
+  case "$(basename "$f")" in
+    .env.example) continue ;;
+    .env|.env.*)
+      echo "[pre-commit] 拦截: $f 是本地私密配置文件(.env 系列),不应入库"
+      fail=1
+      continue
+      ;;
+  esac
+
+  content=$(git show ":$f" 2>/dev/null) || continue
+
+  if printf '%s' "$content" | grep -qE 'MINT_PK=(0x)?[0-9a-fA-F]{64}'; then
+    echo "[pre-commit] 拦截: $f 含 MINT_PK 私钥"
+    fail=1
+  fi
+
+  if printf '%s' "$content" | grep -qE 'lb\.drpc\.live/[A-Za-z0-9_-]{16,}|alchemy\.com/v2/[A-Za-z0-9_-]{16,}|[?&]apikey=[A-Za-z0-9]{16,}|dwellir\.com/[0-9a-fA-F-]{16,}|infura\.io/v3/[0-9a-fA-F]{16,}'; then
+    echo "[pre-commit] 拦截: $f 含带 key 的私有 RPC 地址"
+    fail=1
+  fi
+done
+
+if [ "$fail" = 1 ]; then
+  echo ""
+  echo "以上是本机个人配置,不应进公开仓库。确认无误要强行提交: git commit --no-verify"
+  exit 1
+fi
+
+exit 0

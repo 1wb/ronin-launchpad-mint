@@ -1,0 +1,5 @@
+# shell 脚本统一 LF,避免 Windows 克隆后换行符破坏 sh 脚本
+*.sh text eol=lf
+hooks/* text eol=lf
+*.mjs text eol=lf
+*.bat text eol=crlf

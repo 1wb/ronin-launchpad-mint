@@ -151,6 +151,7 @@ $env:MINT_PK="0x..."; node mint.mjs --go
 - `.env` 是明文私钥,等于钱包本身:已进 [.gitignore](.gitignore),但仍不要提交、不要外传;介意明文就用 `--keystore`。私钥不落日志、不打印、脚本退出即失忆。
 - 白名单绑定地址,导出私钥时认准 你自己的白名单地址;用无痕窗口操作,用完可清空 `.env` 里的 `MINT_PK=`。
 - gas 余额自查:一笔失败 revert 约损耗 0.005 RON,启动时余额不足会直接拒绝。
+- 防误提交:`.gitignore` 排除 `.env` 系列与 `*.key`;另有 `hooks/pre-commit` 作为第二层保险,提交前扫描「私钥形状的 MINT_PK」与「带 key 的私有 RPC 地址」,本仓库已启用(`git config core.hooksPath hooks`,克隆后可选启用)。
 
 ## 文件
 
@@ -158,7 +159,9 @@ $env:MINT_PK="0x..."; node mint.mjs --go
 mint.mjs        脚本本体(单文件源码,可读、可审计)
 dist/mint.cjs   打包单文件(已内置依赖,免 npm install,node dist/mint.cjs 直接跑)
 start.bat / start.sh  Windows / macOS·Linux 启动器(试跑/实弹选择)
-.env            实际配置(含私钥,勿外传,不进 git)
-.env.example    配置模板
-.gitignore      排除 .env / key.json / node_modules
+.env            本机私密配置(含私钥,勿外传,不进 git)
+.env.example    配置模板(只含公共节点)
+.gitignore      排除 .env 系列 / *.key / key.json / node_modules
+.gitattributes  统一换行符(*.sh/*.mjs/hooks 用 LF)
+hooks/pre-commit 提交前私密信息检查(git config core.hooksPath hooks 启用)
 ```
