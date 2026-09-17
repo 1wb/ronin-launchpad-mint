@@ -107,7 +107,9 @@ $env:MINT_PK="0x..."; node mint.mjs --go
 
 目标是**链上读取的每钱包限购**(本场景为 1):每轮先查 `getMintedQtyByUserAtStage`,达到 quota 立即停。交易上链 status=1 后回查链上数量,并从收据日志解出拿到的 **tokenId**。
 
-上链后 revert 的交易会在**同一区块重放**,还原真实原因:`ErrSoldOut`(抢空)/ `ErrStageEnded`(窗口关闭)/ `ErrMinterNotAllowed`(不在白名单)三种判为"重试无意义"直接停止并说明;超时未上链、未知错误则自动换 nonce 重试,`--max-attempts`(默认 5)次封顶。即使还在等开窗,模拟一旦变成这三种原因也会立即停止等待并告知,不会傻等。
+上链后 revert 的交易会在**同一区块重放**,还原真实原因:`ErrZeroMintQuantity`(抢空,或你自己的名额已用完)/ `ErrStageEnded`(窗口关闭)/ `ErrMinterNotAllowed`(不在白名单)判为"重试无意义"直接停止并说明;超时未上链、未知错误则自动换 nonce 重试,`--max-attempts`(默认 5)次封顶。即使还在等开窗,模拟一旦变成这几种原因也会立即停止等待并告知,不会傻等。
+
+> 注意:这套合约里**没有 `ErrSoldOut`**。因为脚本用 `isMintAllPossible = true` 发送,售罄时合约把实际铸造量夹到 0 并回滚 `ErrZeroMintQuantity` —— 所以"卖完了"和"你的配额已用完"是同一个错误码,提示语会把两种可能都写出来。
 
 ## RPC 与 gas 调优
 
@@ -138,11 +140,13 @@ $env:MINT_PK="0x..."; node mint.mjs --go
 |---|---|---|---|---|---|
 | Top Trainers / OG Trainers | 1 / 2 | 已结束 | 0 | - | |
 | Ronin Wave | 3 | 已结束 | 0 | - | 白名单场 |
-| Yakkamon Hunters | 4 | 09-17 16:00 → 09-18 08:00 | 0 | 1 | 白名单场,限量 5000 |
+| Yakkamon Hunters | 4 | 09-17 16:00 → 09-18 08:00 | 0 | 1 | 白名单场,名义限量 5000(受 launch 总上限约束,见下) |
 | Public Trainers | 5 | 09-18 08:00 起 | 0 | - | 白名单场 |
 | Public Stage | 255 | 09-19 08:00 起 | - | - | **public 类型,本脚本不支持** |
 
-以上时间/价格以脚本启动时链上读取为准。已知错误含义:`ErrStageNotStarted` 没开窗;`ErrStageEnded` 已结束;`ErrSoldOut` 抢空;`ErrMinterNotAllowed` 不在白名单。
+> **阶段上限 ≠ 实际可铸数量**。合约 `calcRemainingSupplyForCondStage()` 取 `min(阶段剩余, launch 总剩余)`,而 launch 总剩余 = `launchSupply - 已铸`。以 Yakkamon 为例:launch 总供给 10000,前三波已铸 5963,所以第四波名义 5000、实际只剩 **4037**;第五波名义 10000 也要和第四波抢这同一份余额。脚本启动时会打印 `collection : minted … of launch supply …` 和 `actually mintable here: …` 两行,以它为准。
+
+以上时间/价格以脚本启动时链上读取为准。已知错误含义:`ErrStageNotStarted` 没开窗(继续等);`ErrStageEnded` 已结束;`ErrZeroMintQuantity` 抢空或你的配额已用完;`ErrMaxSupplyExceeded` / `ErrLimitPerWalletExceeded` 供给或限购已满;`ErrMinterNotAllowed` 不在白名单。除第一个外都会直接停止并说明原因。
 
 ## 边界与安全
 

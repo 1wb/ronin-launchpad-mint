@@ -27501,7 +27501,16 @@ function parseArgs(argv) {
   }
   return a;
 }
-var args = parseArgs(process.argv);
+var args;
+try {
+  args = parseArgs(process.argv);
+} catch (e) {
+  console.error(`error: ${e.message}`);
+  console.error("usage: node mint.mjs [--go] [--stage N] [--qty N] [--from 0xaddr] [--keystore file] [--rpc url,url]");
+  console.error("                    [--poll ms] [--gas N] [--tip gwei] [--tip-boost N] [--base-boost N] [--bump N]");
+  console.error("                    [--max-polls N] [--max-attempts N] [--self-test] [--nft 0x..] [--router 0x..]");
+  process.exit(1);
+}
 ROUTER = (args.router ?? process.env.ROUTER_ADDRESS ?? ROUTER_DEFAULT).toLowerCase();
 NFT = (args.nft ?? process.env.NFT_ADDRESS ?? NFT_DEFAULT).toLowerCase();
 var RPC_LIST = (args.rpc ?? process.env.MINT_RPC ?? DEFAULT_RPCS).split(/[\s,]+/).filter(Boolean);
@@ -27587,13 +27596,19 @@ var viewAbi = [
   "function getMintedQtyByUserAtStage(address,uint8,address) view returns (uint256)",
   "function checkIsEligible(address,uint8,address) view returns (bool)",
   "function pausedOf(address) view returns (uint256)",
-  "function getTotalMintedOfNFTContract(address) view returns (uint256)"
+  "function getTotalMintedOfNFTContract(address) view returns (uint256)",
+  // Launch-level ceiling. calcRemainingSupplyForCondStage() returns
+  // min(stage.maxSupply - mintedInStage, launchSupply - mintedOnLaunchpad), so a
+  // stage's nominal maxSupply is often NOT what you can actually still mint.
+  "function getLaunchpadData(address) view returns (address creator, uint8 standard, uint256 launchSupply, bool allowCumulativeLimit, tuple(address recipient, uint16 feeBps, uint8 party, uint256 _reserved)[] allocations, uint256 latestStageIndex)"
 ];
 var errIf = new ethers_exports.Interface([
   "error ErrStageNotStarted()",
   "error ErrStageEnded()",
-  "error ErrSoldOut()",
-  "error ErrMinterNotAllowed(address)"
+  "error ErrMinterNotAllowed(address)",
+  "error ErrZeroMintQuantity()",
+  "error ErrMaxSupplyExceeded(uint256 remainingSupply, uint256 mintQuantity)",
+  "error ErrLimitPerWalletExceeded(uint256 limitPerWallet, uint256 remainMintable, uint256 mintQuantity)"
 ]);
 var mintIf = new ethers_exports.Interface(["function mintAllowList((address,address,uint256,bool,uint8,bytes))"]);
 var execIf = new ethers_exports.Interface(["function execute(uint8,bytes)"]);
@@ -27647,7 +27662,7 @@ async function resolveSender() {
     const password = await rl.question("keystore password: ");
     rl.close();
     const json = (0, import_node_fs.readFileSync)(args.keystore, "utf8");
-    const signer2 = await ethers_exports.Wallet.fromEncryptedJson(json, password, null, (pct) => {
+    const signer2 = await ethers_exports.Wallet.fromEncryptedJson(json, password, (pct) => {
       import_node_process.stdout.write(`\rdecrypting ${pct}%`);
     });
     import_node_process.stdout.write("\n");
@@ -27761,12 +27776,15 @@ async function main() {
   const balance = await anyPool((p) => p.getBalance(address), "getBalance");
   console.log(`balance    : ${ron(balance)}`);
   if (args.go && balance === 0n) throw new Error("wallet has no RON for gas");
-  const [all, totalMinted, paused] = await Promise.all([
+  const [all, totalMinted, paused, launch] = await Promise.all([
     anyPool((p) => viewsOn(p).getAllStages(NFT), "getAllStages"),
     anyPool((p) => viewsOn(p).getTotalMintedOfNFTContract(NFT), "getTotalMinted"),
-    anyPool((p) => viewsOn(p).pausedOf(NFT), "pausedOf")
+    anyPool((p) => viewsOn(p).pausedOf(NFT), "pausedOf"),
+    anyPool((p) => viewsOn(p).getLaunchpadData(NFT), "getLaunchpadData")
   ]);
-  console.log(`collection : minted ${totalMinted}, paused ${paused}`);
+  const launchSupply = BigInt(launch.launchSupply);
+  const launchLeft = launchSupply > totalMinted ? launchSupply - totalMinted : 0n;
+  console.log(`collection : minted ${totalMinted} of launch supply ${launchSupply} (${launchLeft} left for all stages), paused ${paused}`);
   const [publicIdxs, allowIdxs, gatedIdxs] = all.stageIndexes;
   const allowIndexList = allowIdxs.map(Number);
   const pos = allowIndexList.indexOf(args.stage);
@@ -27787,18 +27805,25 @@ async function main() {
     eligible = await anyPool((p) => viewsOn(p).checkIsEligible(NFT, args.stage, address), "checkIsEligible");
   } catch {
   }
+  const stageLeft = maxSupply > mintedInStage ? maxSupply - mintedInStage : 0n;
+  const usableLeft = stageLeft < launchLeft ? stageLeft : launchLeft;
   console.log(`stage ${args.stage}     : ${fmtTime(startTime)} -> ${fmtTime(endTime)} (local time)`);
   console.log(`             price ${ron(price)}, per-wallet limit ${maxMintablePerWallet}, `);
   console.log(`             stage supply ${maxSupply}, minted in stage ${mintedInStage}`);
+  console.log(`             actually mintable here: ${usableLeft} = min(stage left ${stageLeft}, launch left ${launchLeft})`);
   console.log(`             you minted ${mintedByUser}, eligible ${eligible}`);
-  if (eligible === false) throw new Error("address is NOT on the on-chain allowlist for this stage; tx would revert");
+  const gate = (msg) => {
+    if (args.go) throw new Error(msg);
+    console.log(`warning    : ${msg} \u2014 dry-run, still simulating to show the real revert`);
+  };
+  if (eligible === false) gate("address is NOT on the on-chain allowlist for this stage; a real tx would revert");
   if (mintedByUser + BigInt(args.qty) > BigInt(maxMintablePerWallet))
-    throw new Error("requested qty exceeds this wallet's per-stage limit; tx would revert");
+    gate("requested qty exceeds this wallet's per-stage limit; a real tx would revert");
   const value = price * BigInt(args.qty);
   const inner = mintIf.encodeFunctionData("mintAllowList", [[NFT, address, BigInt(args.qty), true, args.stage, "0x00"]]);
   const calldata = execIf.encodeFunctionData("execute", [ALLOWLIST_STAGE_TYPE, inner]);
   const need = value + args.gas * gwei(0.05);
-  if (balance < need) throw new Error(`balance ${ron(balance)} likely too low for value+gas (~${ron(need)})`);
+  if (balance < need) gate(`balance ${ron(balance)} likely too low for value+gas (~${ron(need)})`);
   console.log(`gas plan   : ${args.tip ? `fixed tip ${args.tip} gwei (--tip override)` : `auto premium: tip = live median \xD7 ${args.tipBoost}, baseFee \xD7 ${args.baseBoost}%`} (+${args.bump}% headroom, overpay refunded)`);
   console.log(`calldata   : to ${ROUTER}, value ${ron(value)}`);
   console.log(`             ${calldata}`);
@@ -27815,15 +27840,17 @@ async function main() {
       console.log(`no receipt \u2014 check https://app.roninchain.com/tx/${hash2}`);
       return;
     }
-    const burned = ron(rc.gasUsed * (rc.effectiveGasPrice ?? 0n));
+    const burned = ron(rc.gasUsed * (rc.gasPrice ?? rc.effectiveGasPrice ?? 0n));
     console.log(rc.status === 1 ? `SELF-TEST \u2713 : fire path fully working (fee burned: ${burned})` : `SELF-TEST \u2717 : tx landed but status ${rc.status}`);
     return;
   }
   const target = Number(maxMintablePerWallet);
   const maxAttempts = args.maxAttempts;
-  const STOP = /* @__PURE__ */ new Set(["ErrStageEnded", "ErrSoldOut", "ErrMinterNotAllowed"]);
+  const STOP = /* @__PURE__ */ new Set(["ErrStageEnded", "ErrZeroMintQuantity", "ErrMaxSupplyExceeded", "ErrLimitPerWalletExceeded", "ErrMinterNotAllowed"]);
   const STOP_HINT = {
-    ErrSoldOut: "stage supply exhausted",
+    ErrZeroMintQuantity: "no supply left for this wallet: stage/launch sold out, or your per-stage quota is already used",
+    ErrMaxSupplyExceeded: "stage/launch supply exhausted",
+    ErrLimitPerWalletExceeded: "this wallet already reached its per-stage limit",
     ErrStageEnded: "mint window closed",
     ErrMinterNotAllowed: "address is not on this stage's allowlist"
   };

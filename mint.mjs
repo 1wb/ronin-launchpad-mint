@@ -120,7 +120,16 @@ function parseArgs(argv) {
   }
   return a;
 }
-const args = parseArgs(process.argv);
+let args;
+try {
+  args = parseArgs(process.argv);
+} catch (e) {
+  console.error(`error: ${e.message}`);
+  console.error("usage: node mint.mjs [--go] [--stage N] [--qty N] [--from 0xaddr] [--keystore file] [--rpc url,url]");
+  console.error("                    [--poll ms] [--gas N] [--tip gwei] [--tip-boost N] [--base-boost N] [--bump N]");
+  console.error("                    [--max-polls N] [--max-attempts N] [--self-test] [--nft 0x..] [--router 0x..]");
+  process.exit(1);
+}
 ROUTER = (args.router ?? process.env.ROUTER_ADDRESS ?? ROUTER_DEFAULT).toLowerCase();
 NFT = (args.nft ?? process.env.NFT_ADDRESS ?? NFT_DEFAULT).toLowerCase();
 
@@ -198,11 +207,23 @@ const viewAbi = [
   "function checkIsEligible(address,uint8,address) view returns (bool)",
   "function pausedOf(address) view returns (uint256)",
   "function getTotalMintedOfNFTContract(address) view returns (uint256)",
+  // Launch-level ceiling. calcRemainingSupplyForCondStage() returns
+  // min(stage.maxSupply - mintedInStage, launchSupply - mintedOnLaunchpad), so a
+  // stage's nominal maxSupply is often NOT what you can actually still mint.
+  "function getLaunchpadData(address) view returns (address creator, uint8 standard, uint256 launchSupply, bool allowCumulativeLimit, tuple(address recipient, uint16 feeBps, uint8 party, uint256 _reserved)[] allocations, uint256 latestStageIndex)",
 ];
 
+// Revert set taken from the DEPLOYED MavisLaunchpad / AllowlistStageLogic ABIs.
+// Note: these contracts define no ErrSoldOut. Because we mint with
+// isMintAllPossible = true, _checkMintQuantity clamps actualQuantity to
+// min(requested, remaining) and reverts ErrZeroMintQuantity when that is 0 —
+// so "stage sold out" and "your wallet already used its quota" both surface as
+// ErrZeroMintQuantity, and the stage/launch ceiling surfaces as
+// ErrMaxSupplyExceeded only if the request is not clamped.
 const errIf = new ethers.Interface([
-  "error ErrStageNotStarted()", "error ErrStageEnded()", "error ErrSoldOut()",
-  "error ErrMinterNotAllowed(address)",
+  "error ErrStageNotStarted()", "error ErrStageEnded()", "error ErrMinterNotAllowed(address)",
+  "error ErrZeroMintQuantity()", "error ErrMaxSupplyExceeded(uint256 remainingSupply, uint256 mintQuantity)",
+  "error ErrLimitPerWalletExceeded(uint256 limitPerWallet, uint256 remainMintable, uint256 mintQuantity)",
 ]);
 const mintIf = new ethers.Interface(["function mintAllowList((address,address,uint256,bool,uint8,bytes))"]);
 const execIf = new ethers.Interface(["function execute(uint8,bytes)"]);
@@ -259,7 +280,9 @@ async function resolveSender() {
     const password = await rl.question("keystore password: ");
     rl.close();
     const json = readFileSync(args.keystore, "utf8");
-    const signer = await ethers.Wallet.fromEncryptedJson(json, password, null, (pct) => {
+    // ethers v6: fromEncryptedJson(json, password, progress?) — the callback is
+    // the 3rd arg (v5's 4th-arg callback silently breaks the whole feature).
+    const signer = await ethers.Wallet.fromEncryptedJson(json, password, (pct) => {
       output.write(`\rdecrypting ${pct}%`);
     });
     output.write("\n");
@@ -382,12 +405,15 @@ async function main() {
   console.log(`balance    : ${ron(balance)}`);
   if (args.go && balance === 0n) throw new Error("wallet has no RON for gas");
 
-  const [all, totalMinted, paused] = await Promise.all([
+  const [all, totalMinted, paused, launch] = await Promise.all([
     anyPool((p) => viewsOn(p).getAllStages(NFT), "getAllStages"),
     anyPool((p) => viewsOn(p).getTotalMintedOfNFTContract(NFT), "getTotalMinted"),
     anyPool((p) => viewsOn(p).pausedOf(NFT), "pausedOf"),
+    anyPool((p) => viewsOn(p).getLaunchpadData(NFT), "getLaunchpadData"),
   ]);
-  console.log(`collection : minted ${totalMinted}, paused ${paused}`);
+  const launchSupply = BigInt(launch.launchSupply);
+  const launchLeft = launchSupply > totalMinted ? launchSupply - totalMinted : 0n;
+  console.log(`collection : minted ${totalMinted} of launch supply ${launchSupply} (${launchLeft} left for all stages), paused ${paused}`);
 
   const [publicIdxs, allowIdxs, gatedIdxs] = all.stageIndexes;
   const allowIndexList = allowIdxs.map(Number);
@@ -411,19 +437,30 @@ async function main() {
   try { eligible = await anyPool((p) => viewsOn(p).checkIsEligible(NFT, args.stage, address), "checkIsEligible"); }
   catch { /* not allowlist */ }
 
+  const stageLeft = maxSupply > mintedInStage ? maxSupply - mintedInStage : 0n;
+  const usableLeft = stageLeft < launchLeft ? stageLeft : launchLeft; // exactly what the contract computes
   console.log(`stage ${args.stage}     : ${fmtTime(startTime)} -> ${fmtTime(endTime)} (local time)`);
   console.log(`             price ${ron(price)}, per-wallet limit ${maxMintablePerWallet}, `);
   console.log(`             stage supply ${maxSupply}, minted in stage ${mintedInStage}`);
+  console.log(`             actually mintable here: ${usableLeft} = min(stage left ${stageLeft}, launch left ${launchLeft})`);
   console.log(`             you minted ${mintedByUser}, eligible ${eligible}`);
-  if (eligible === false) throw new Error("address is NOT on the on-chain allowlist for this stage; tx would revert");
+  // Hard stops only when actually firing. In dry-run these stay diagnostics: the
+  // simulation loop reports the same problem as a real revert reason
+  // (ErrMinterNotAllowed / ErrZeroMintQuantity), which is more useful than a
+  // pre-flight abort — and lets you dry-run an address you don't control.
+  const gate = (msg) => {
+    if (args.go) throw new Error(msg);
+    console.log(`warning    : ${msg} — dry-run, still simulating to show the real revert`);
+  };
+  if (eligible === false) gate("address is NOT on the on-chain allowlist for this stage; a real tx would revert");
   if (mintedByUser + BigInt(args.qty) > BigInt(maxMintablePerWallet))
-    throw new Error("requested qty exceeds this wallet's per-stage limit; tx would revert");
+    gate("requested qty exceeds this wallet's per-stage limit; a real tx would revert");
 
   const value = price * BigInt(args.qty);
   const inner = mintIf.encodeFunctionData("mintAllowList", [[NFT, address, BigInt(args.qty), true, args.stage, "0x00"]]);
   const calldata = execIf.encodeFunctionData("execute", [ALLOWLIST_STAGE_TYPE, inner]);
   const need = value + args.gas * gwei(0.05); // rough 50 gwei ceiling sanity
-  if (balance < need) throw new Error(`balance ${ron(balance)} likely too low for value+gas (~${ron(need)})`);
+  if (balance < need) gate(`balance ${ron(balance)} likely too low for value+gas (~${ron(need)})`);
 
   console.log(`gas plan   : ${args.tip ? `fixed tip ${args.tip} gwei (--tip override)` : `auto premium: tip = live median × ${args.tipBoost}, baseFee × ${args.baseBoost}%`} (+${args.bump}% headroom, overpay refunded)`);
   console.log(`calldata   : to ${ROUTER}, value ${ron(value)}`);
@@ -437,7 +474,7 @@ async function main() {
     console.log("self-test  : firing a 0-RON self-transfer through the real fire path ...");
     const { rc, hash } = await fireRaw(signer, address, { to: address, value: 0n, gasLimit: 21000n });
     if (!rc) { console.log(`no receipt — check https://app.roninchain.com/tx/${hash}`); return; }
-    const burned = ron(rc.gasUsed * (rc.effectiveGasPrice ?? 0n));
+    const burned = ron(rc.gasUsed * (rc.gasPrice ?? rc.effectiveGasPrice ?? 0n)); // ethers v6: receipt.gasPrice
     console.log(rc.status === 1
       ? `SELF-TEST ✓ : fire path fully working (fee burned: ${burned})`
       : `SELF-TEST ✗ : tx landed but status ${rc.status}`);
@@ -450,9 +487,11 @@ async function main() {
   // reasons (sold out / window closed / not allowlisted) stop, the rest retry.
   const target = Number(maxMintablePerWallet);
   const maxAttempts = args.maxAttempts;
-  const STOP = new Set(["ErrStageEnded", "ErrSoldOut", "ErrMinterNotAllowed"]);
+  const STOP = new Set(["ErrStageEnded", "ErrZeroMintQuantity", "ErrMaxSupplyExceeded", "ErrLimitPerWalletExceeded", "ErrMinterNotAllowed"]);
   const STOP_HINT = {
-    ErrSoldOut: "stage supply exhausted",
+    ErrZeroMintQuantity: "no supply left for this wallet: stage/launch sold out, or your per-stage quota is already used",
+    ErrMaxSupplyExceeded: "stage/launch supply exhausted",
+    ErrLimitPerWalletExceeded: "this wallet already reached its per-stage limit",
     ErrStageEnded: "mint window closed",
     ErrMinterNotAllowed: "address is not on this stage's allowlist",
   };
