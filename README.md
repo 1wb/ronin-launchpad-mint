@@ -114,7 +114,7 @@ $env:MINT_PK="0x..."; node mint.mjs --go
 
 ## RPC 与 gas 调优
 
-**多 RPC**:脚本启动时对本机到各端点做 `eth_blockNumber` 延迟实测(2 次取最小),最快者做模拟/轮询主端点;开火时**签名一次、向所有存活端点并行广播** `eth_sendRawTransaction`(同一笔交易同一 hash,链上自动去重,纯提速无副作用)。
+**多 RPC**:脚本启动时对每个端点依次做 `eth_chainId` → `eth_blockNumber` 延迟实测 → **一次真实 `eth_call` 探活**,只有 `eth_call` 打得通的端点才会排在前面当主端点,读不通的会自动排到后面、只参与并行广播(并在启动时标 ⚠ 提示你删掉)。之所以要探 `eth_call`:延迟低不等于能用——2026-09-17 实测 dRPC 的 `eth_blockNumber` 只要 ~250ms,但**每个 `eth_call` 都返回 HTTP 500**,旧版会把它选成主端点,导致每次读请求都先白失败一次。开火时**签名一次、向所有存活端点并行广播** `eth_sendRawTransaction`(同一笔交易同一 hash,链上自动去重,纯提速无副作用)。
 
 2026-09-17 本机实测:
 

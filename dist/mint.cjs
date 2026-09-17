@@ -27616,6 +27616,7 @@ var errIf = new ethers_exports.Interface([
 ]);
 var mintIf = new ethers_exports.Interface(["function mintAllowList((address,address,uint256,bool,uint8,bytes))"]);
 var execIf = new ethers_exports.Interface(["function execute(uint8,bytes)"]);
+var CALL_PROBE_DATA = new ethers_exports.Interface(["function getAllConstants() view returns (uint256,uint32,uint8,uint64)"]).encodeFunctionData("getAllConstants");
 var fmtTime = (sec) => sec >= 2n ** 63n ? "\u221E" : new Date(Number(sec) * 1e3).toLocaleString();
 var ron = (wei) => `${ethers_exports.formatEther(wei)} RON`;
 var gweiStr = (wei) => `${ethers_exports.formatUnits(wei, "gwei")} gwei`;
@@ -27625,7 +27626,7 @@ var medianOf = (arr) => {
   return s[s.length - 1 >> 1];
 };
 async function probeRpc(url) {
-  const post = async (method) => {
+  const post = async (method, params = []) => {
     const t0 = performance.now();
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 6e3);
@@ -27633,7 +27634,7 @@ async function probeRpc(url) {
       const r = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: [] }),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
         signal: ctl.signal
       });
       const j = await r.json().catch(() => null);
@@ -27653,17 +27654,29 @@ async function probeRpc(url) {
     if (r.ok) rtts.push(r.ms);
   }
   if (rtts.length === 0) return { url, ok: false, err: "blockNumber probe failed" };
-  return { url, ok: true, ms: Math.min(...rtts) };
+  const probe = await post("eth_call", [{ to: ROUTER, data: CALL_PROBE_DATA }, "latest"]);
+  const readOk = probe.ok && typeof probe.result === "string" && probe.result.length > 2;
+  return { url, ok: true, ms: Math.min(...rtts), readOk, readErr: readOk ? "" : String(probe.err) };
 }
 async function selectPrimary() {
   console.log(`benchmarking ${RPC_LIST.length} rpc endpoint(s) ...`);
   const probes = await Promise.all(RPC_LIST.map(probeRpc));
-  const alive = probes.filter((p) => p.ok).sort((a, b2) => a.ms - b2.ms);
+  const alive = probes.filter((p) => p.ok);
+  const ranked = [
+    ...alive.filter((p) => p.readOk).sort((a, b2) => a.ms - b2.ms),
+    ...alive.filter((p) => !p.readOk).sort((a, b2) => a.ms - b2.ms)
+  ];
   for (const p of probes) {
-    console.log(p.ok ? `  \u2713 ${String(Math.round(p.ms)).padStart(5)} ms  ${p.url}` : `  \u2717 ${String(p.err).padEnd(22)}  ${p.url}`);
+    if (!p.ok) {
+      console.log(`  \u2717 ${String(p.err).padEnd(30)}  ${p.url}`);
+      continue;
+    }
+    console.log(p.readOk ? `  \u2713 ${String(Math.round(p.ms)).padStart(5)} ms  ${p.url}` : `  \u26A0 ${String(Math.round(p.ms)).padStart(5)} ms  ${p.url}  \u2190 eth_call \u5931\u8D25(${String(p.readErr).slice(0, 40)}),\u53EA\u4F5C\u5E7F\u64AD\u955C\u50CF`);
   }
-  if (alive.length === 0) throw new Error("all configured RPC endpoints failed");
-  return alive.map((p) => p.url);
+  const broken = alive.filter((p) => !p.readOk).length;
+  if (broken) console.log(`             ${broken} \u4E2A\u7AEF\u70B9\u8BFB\u4E0D\u901A(\u8BFB\u8BF7\u6C42\u4F1A\u81EA\u52A8\u8DF3\u8FC7\u5B83\u4EEC);\u60F3\u66F4\u5E72\u51C0\u5C31\u628A\u5B83\u4EEC\u4ECE MINT_RPC \u91CC\u5220\u6389`);
+  if (ranked.length === 0) throw new Error("all configured RPC endpoints failed");
+  return ranked.map((p) => p.url);
 }
 async function resolveSender() {
   if (args.from) return { address: args.from, signer: null };
@@ -27898,8 +27911,8 @@ async function main() {
 `);
   if (args.selfTest) {
     if (!signer) throw new Error("--self-test sends a real (tiny) tx and needs a key: fill MINT_PK in .env");
-    console.log("self-test  : firing a 0-RON self-transfer through the real fire path ...");
-    const fired = await fireRaw(signer, address, { to: address, value: 0n, gasLimit: 21000n });
+    console.log(`self-test  : firing a 0-RON self-transfer at gasLimit ${args.gas} \u2014 the same limit the mint uses, so this rehearses its balance guarantee (only 21000 gas is actually burned) ...`);
+    const fired = await fireRaw(signer, address, { to: address, value: 0n, gasLimit: args.gas });
     if (fired.rejected) {
       console.log("SELF-TEST \u2717 : every endpoint refused the tx (reason above) \u2014 nothing was sent");
       process.exitCode = 1;

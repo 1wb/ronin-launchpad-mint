@@ -26,6 +26,9 @@
 //   node mint.mjs --stage 5 --qty 1 --go
 //   node mint.mjs --tip 3 --bump 150       # fixed 3 gwei tip overrides auto mode
 //   node mint.mjs --self-test              # drill the real fire path with a 0-RON self-transfer
+//                                          # sent at --gas, i.e. at the SAME gasLimit as the mint,
+//                                          # so it rehearses the mint's balance guarantee
+//                                          # (gasLimit × maxFee) while burning only 21000 gas
 //                                          # gas is AUTOMATIC by default: tip = live median
 //                                          # priority × --tip-boost (2), maxFee = next-block
 //                                          # baseFee × --base-boost (200%) + tip, + bump headroom
@@ -233,6 +236,9 @@ const errIf = new ethers.Interface([
 ]);
 const mintIf = new ethers.Interface(["function mintAllowList((address,address,uint256,bool,uint8,bytes))"]);
 const execIf = new ethers.Interface(["function execute(uint8,bytes)"]);
+// Cheapest possible view call, used to prove an endpoint can actually serve
+// eth_call before we let it become the primary.
+const CALL_PROBE_DATA = new ethers.Interface(["function getAllConstants() view returns (uint256,uint32,uint8,uint64)"]).encodeFunctionData("getAllConstants");
 
 const fmtTime = (sec) => sec >= 2n ** 63n ? "∞" : new Date(Number(sec) * 1000).toLocaleString();
 const ron = (wei) => `${ethers.formatEther(wei)} RON`;
@@ -249,14 +255,14 @@ const medianOf = (arr) => {
 
 // Raw-fetch RTT probe: cheap, independent of ethers internals.
 async function probeRpc(url) {
-  const post = async (method) => {
+  const post = async (method, params = []) => {
     const t0 = performance.now();
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 6000);
     try {
       const r = await fetch(url, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: [] }), signal: ctl.signal,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: ctl.signal,
       });
       const j = await r.json().catch(() => null);
       return { ms: performance.now() - t0, ok: !!j?.result, result: j?.result, err: j?.error?.message ?? `HTTP ${r.status}` };
@@ -273,20 +279,35 @@ async function probeRpc(url) {
     if (r.ok) rtts.push(r.ms);
   }
   if (rtts.length === 0) return { url, ok: false, err: "blockNumber probe failed" };
-  return { url, ok: true, ms: Math.min(...rtts) };
+  // Latency on eth_blockNumber says nothing about eth_call — and eth_call is the
+  // entire workload of this bot. dRPC answered blockNumber in ~250ms while
+  // failing EVERY eth_call with HTTP 500 (2026-09-17), so it kept being ranked
+  // as the fastest endpoint and then wasted a failed attempt on every read.
+  const probe = await post("eth_call", [{ to: ROUTER, data: CALL_PROBE_DATA }, "latest"]);
+  const readOk = probe.ok && typeof probe.result === "string" && probe.result.length > 2;
+  return { url, ok: true, ms: Math.min(...rtts), readOk, readErr: readOk ? "" : String(probe.err) };
 }
 
 async function selectPrimary() {
   console.log(`benchmarking ${RPC_LIST.length} rpc endpoint(s) ...`);
   const probes = await Promise.all(RPC_LIST.map(probeRpc));
-  const alive = probes.filter((p) => p.ok).sort((a, b) => a.ms - b.ms);
+  const alive = probes.filter((p) => p.ok);
+  // Readable endpoints first (they become primary + the sticky start), then the
+  // transport-only ones, which are still useful as parallel broadcast mirrors.
+  const ranked = [
+    ...alive.filter((p) => p.readOk).sort((a, b) => a.ms - b.ms),
+    ...alive.filter((p) => !p.readOk).sort((a, b) => a.ms - b.ms),
+  ];
   for (const p of probes) {
-    console.log(p.ok
+    if (!p.ok) { console.log(`  ✗ ${String(p.err).padEnd(30)}  ${p.url}`); continue; }
+    console.log(p.readOk
       ? `  ✓ ${String(Math.round(p.ms)).padStart(5)} ms  ${p.url}`
-      : `  ✗ ${String(p.err).padEnd(22)}  ${p.url}`);
+      : `  ⚠ ${String(Math.round(p.ms)).padStart(5)} ms  ${p.url}  ← eth_call 失败(${String(p.readErr).slice(0, 40)}),只作广播镜像`);
   }
-  if (alive.length === 0) throw new Error("all configured RPC endpoints failed");
-  return alive.map((p) => p.url);
+  const broken = alive.filter((p) => !p.readOk).length;
+  if (broken) console.log(`             ${broken} 个端点读不通(读请求会自动跳过它们);想更干净就把它们从 MINT_RPC 里删掉`);
+  if (ranked.length === 0) throw new Error("all configured RPC endpoints failed");
+  return ranked.map((p) => p.url);
 }
 
 async function resolveSender() {
@@ -555,8 +576,8 @@ async function main() {
 
   if (args.selfTest) {
     if (!signer) throw new Error("--self-test sends a real (tiny) tx and needs a key: fill MINT_PK in .env");
-    console.log("self-test  : firing a 0-RON self-transfer through the real fire path ...");
-    const fired = await fireRaw(signer, address, { to: address, value: 0n, gasLimit: 21000n });
+    console.log(`self-test  : firing a 0-RON self-transfer at gasLimit ${args.gas} — the same limit the mint uses, so this rehearses its balance guarantee (only 21000 gas is actually burned) ...`);
+    const fired = await fireRaw(signer, address, { to: address, value: 0n, gasLimit: args.gas });
     if (fired.rejected) { console.log("SELF-TEST ✗ : every endpoint refused the tx (reason above) — nothing was sent"); process.exitCode = 1; return; }
     if (fired.dropped) { console.log("SELF-TEST ✗ : the tx never reached any mempool"); process.exitCode = 1; return; }
     const { rc, hash } = fired;
