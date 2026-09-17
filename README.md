@@ -91,11 +91,12 @@ $env:MINT_PK="0x..."; node mint.mjs --go
 | `--stage N` | 4 | 4=Yakkamon Hunters,5=Public Trainers |
 | `--qty N` | 1 | 本次 mint 数量 |
 | `--poll ms` | 800 | 模拟轮询间隔(RPC 限频 30/s、100/min,别低于 400) |
-| `--gas N` | 420000 | gasLimit,实测 mint 约 34.1 万 |
+| `--gas N` | 350000 | gasLimit,实测 mint 约 27~29 万,留约 20% 余量(它同时决定余额担保,见下) |
 | `--tip N` | 自动 | 固定 tip(gwei);**默认不填即自动模式**:实时中位优先费 × `--tip-boost` |
-| `--tip-boost N` | 2 | 自动:tip = 实时中位优先费 × N(跟随行情自动加价) |
+| `--tip-boost N` | 2 | 自动:tip = **中位**优先费 × N(跟随行情自动加价) |
+| `--tip-cap N` | 5 | 自动:tip 硬上限 = 下一块 baseFee × N,防单块天价小费带偏 |
 | `--base-boost N` | 200 | 自动:maxFee 的 base 分量 = 下一块预测 baseFee × N% |
-| `--bump N` | 150 | maxFee 再乘 N% 余量(EIP-1559 超付退还,调高是免费保险) |
+| `--bump N` | 150 | maxFee 再乘 N% 余量 |
 | `--rpc urls` | `.env` | 逗号分隔多端点,启动测速,最快者做主 |
 | `--keystore f.json` | - | 加密 keystore 代替明文私钥(会提示输密码) |
 | `--max-attempts N` | 5 | 开火次数上限,达 quota 或判定无意义重试即停 |
@@ -128,8 +129,9 @@ $env:MINT_PK="0x..."; node mint.mjs --go
 
 **gas 自动加价(默认)**:开火瞬间读取链上 `eth_feeHistory`(最近 5 块)实时行情,自动定价——
 
-- **tip(插队杠杆)= 实时成交中位优先费 × `--tip-boost`(默认 2 倍)**:人群出 1 gwei 它自动出 2,人群涨它跟着涨,始终压市场一头;
-- **maxFee = 下一块预测 baseFee × `--base-boost`(默认 200%)+ tip,再 × `--bump`(150%)余量**:防开抢瞬间 baseFee 跳升被拒;EIP-1559 超付部分**全数退还**,给高是免费保险;
+- **tip(插队杠杆)= 实时成交优先费的「中位数」× `--tip-boost`(默认 2 倍)**:注意取的是中位数而不是"最新一块",因为只需一笔天价小费就能把最新值带偏(2026-09-17 16:00 实测:五块的优先费是 `1, 1, 1, 1, 3980` gwei,取最新值会一路算出 23880 gwei 的 maxFee);另有 `--tip-cap`(默认 5)兜底,即 tip 不超过下一块 baseFee 的 5 倍;
+- **maxFee = 下一块预测 baseFee × `--base-boost`(默认 200%)+ tip,再 × `--bump`(150%)余量**:防开抢瞬间 baseFee 跳升被拒;
+- **余额担保(重要)**:EIP-1559 只退还「实际用量」多付的部分,但交易进内存池的硬性条件是 `余额 ≥ gasLimit × maxFee + value`。maxFee 被抬高会让交易**根本进不了池**——节点直接回 `insufficient funds`,连上链竞争的机会都没有。所以签名前会按余额把 maxFee/tip 钳到付得起的水平并打印;若钳完仍低于当前 baseFee,脚本会带着明确原因**拒绝发交易**而不是白扔一笔废交易。想留更多余量就调低 `--gas`(它同时压低担保)。
 - `--tip 3` 可切换为固定值覆盖自动;极端情况下 feeHistory 不可用时自动退回 RPC 建议值。
 
 实测示例(2026-09-17):`auto tip 2.0 gwei (live median 1.0 gwei × 2), maxFee 63.0 gwei (next baseFee 20.0 gwei × 200% + tip, × 150%)`。免费场单笔成本约 0.007 RON,自动加价只多 ~0.001 RON。

@@ -27465,11 +27465,13 @@ function parseArgs(argv) {
     qty: envNum("QTY", 1),
     go: false,
     poll: envNum("POLL", 800),
-    gas: BigInt(process.env.GAS ?? "420000"),
+    gas: BigInt(process.env.GAS ?? "350000"),
     tip: envNum("GAS_TIP_GWEI", 0),
     // 0 = auto (live feeHistory premium)
     tipBoost: envNum("GAS_TIP_BOOST", 2),
-    // auto: tip = live median priority × boost
+    // auto: tip = median priority fee × boost
+    tipCapX: envNum("GAS_TIP_CAP", 5),
+    // auto: never bid more than baseFee × this
     baseBoost: envNum("GAS_BASE_BOOST", 200),
     // auto: maxFee base = next baseFee × 200%
     bump: envNum("GAS_BUMP_PCT", 150),
@@ -27487,6 +27489,7 @@ function parseArgs(argv) {
     else if (k === "--gas") a.gas = BigInt(argv[++i]);
     else if (k === "--tip") a.tip = Number(argv[++i]);
     else if (k === "--tip-boost") a.tipBoost = Number(argv[++i]);
+    else if (k === "--tip-cap") a.tipCapX = Number(argv[++i]);
     else if (k === "--base-boost") a.baseBoost = Number(argv[++i]);
     else if (k === "--bump") a.bump = Number(argv[++i]);
     else if (k === "--max-polls") a.maxPolls = Number(argv[++i]);
@@ -27543,6 +27546,7 @@ async function anyPool(fn, what) {
   throw lastErr;
 }
 var shortErr = (e) => String(e?.shortMessage ?? e?.message ?? e).slice(0, 90);
+var rawErr = (e) => String(e?.info?.error?.message ?? e?.error?.message ?? shortErr(e)).slice(0, 160);
 var viewAbi = [
   { type: "function", name: "getAllStages", stateMutability: "view", inputs: [{ type: "address" }], outputs: [
     { type: "uint256[][3]", name: "stageIndexes" },
@@ -27614,6 +27618,12 @@ var mintIf = new ethers_exports.Interface(["function mintAllowList((address,addr
 var execIf = new ethers_exports.Interface(["function execute(uint8,bytes)"]);
 var fmtTime = (sec) => sec >= 2n ** 63n ? "\u221E" : new Date(Number(sec) * 1e3).toLocaleString();
 var ron = (wei) => `${ethers_exports.formatEther(wei)} RON`;
+var gweiStr = (wei) => `${ethers_exports.formatUnits(wei, "gwei")} gwei`;
+var medianOf = (arr) => {
+  if (!arr.length) return 0n;
+  const s = [...arr].sort((x, y) => x < y ? -1 : x > y ? 1 : 0);
+  return s[s.length - 1 >> 1];
+};
 async function probeRpc(url) {
   const post = async (method) => {
     const t0 = performance.now();
@@ -27705,21 +27715,43 @@ function decodeRevert(e) {
     return `revert ${data4.slice(0, 10)}`;
   }
 }
+async function txKnownAnywhere(hash2) {
+  for (const p of pool) {
+    try {
+      if (await p.getTransaction(hash2)) return true;
+    } catch {
+    }
+  }
+  return false;
+}
 async function waitReceipt(hash2, deadlineMs) {
   const deadline = Date.now() + deadlineMs;
+  const started = Date.now();
+  let probed = false;
   while (Date.now() < deadline) {
     for (const p of pool) {
       try {
         const rc = await p.getTransactionReceipt(hash2);
-        if (rc) return rc;
+        if (rc) return { rc, dropped: false };
       } catch {
+      }
+    }
+    if (!probed && Date.now() - started > 12e3) {
+      probed = true;
+      if (!await txKnownAnywhere(hash2)) {
+        console.log(`tx         : no endpoint knows ${hash2} after 12s \u2014 the tx was never accepted`);
+        return { rc: null, dropped: true };
       }
     }
     await new Promise((r) => setTimeout(r, 1e3));
   }
-  return null;
+  return { rc: null, dropped: false };
 }
 async function fireRaw(signer, address, txFields) {
+  const gasLimit = BigInt(txFields.gasLimit);
+  const value = BigInt(txFields.value ?? 0n);
+  const balance = await anyPool((p) => p.getBalance(address), "getBalance");
+  const baseNow = (await anyPool((p) => p.getBlock("latest"), "getBlock")).baseFeePerGas ?? 0n;
   let tip, maxFee;
   if (args.tip) {
     tip = gwei(args.tip);
@@ -27733,20 +27765,45 @@ async function fireRaw(signer, address, txFields) {
       const baseFees = fh.baseFeePerGas.map(BigInt);
       const baseNext = baseFees[baseFees.length - 1];
       const rewards = (fh.reward ?? []).map((r) => BigInt(r[0])).filter((x) => x > 0n);
-      const rewardLive = rewards.length ? rewards[rewards.length - 1] : 0n;
-      tip = rewardLive > 0n ? rewardLive * BigInt(Math.round(args.tipBoost * 100)) / 100n : gwei(1);
+      const medianReward = medianOf(rewards);
+      const latestReward = rewards.length ? rewards[rewards.length - 1] : 0n;
+      tip = medianReward > 0n ? medianReward * BigInt(Math.round(args.tipBoost * 100)) / 100n : gwei(1);
       if (tip < gwei(1)) tip = gwei(1);
+      const tipCeil = baseNext * BigInt(args.tipCapX);
+      let capped = false;
+      if (tipCeil > 0n && tip > tipCeil) {
+        tip = tipCeil;
+        capped = true;
+      }
       maxFee = (baseNext * BigInt(args.baseBoost) / 100n + tip) * BigInt(args.bump) / 100n;
       if (maxFee <= tip * 2n) maxFee = tip * 3n;
-      console.log(`gas       : auto tip ${ethers_exports.formatUnits(tip, "gwei")} gwei (live median ${ethers_exports.formatUnits(rewardLive, "gwei")} gwei \xD7 ${args.tipBoost}), maxFee ${ethers_exports.formatUnits(maxFee, "gwei")} gwei (next baseFee ${ethers_exports.formatUnits(baseNext, "gwei")} gwei \xD7 ${args.baseBoost}% + tip, \xD7 ${args.bump}%)`);
+      console.log(`gas       : auto tip ${gweiStr(tip)} (median ${gweiStr(medianReward)} \xD7 ${args.tipBoost}${capped ? `, capped at baseFee \xD7 ${args.tipCapX}` : ""}; last block sampled ${gweiStr(latestReward)})`);
+      console.log(`             maxFee ${gweiStr(maxFee)} (next baseFee ${gweiStr(baseNext)} \xD7 ${args.baseBoost}% + tip, \xD7 ${args.bump}%)`);
     } catch {
       const fee = await anyPool((p) => p.getFeeData(), "getFeeData");
       tip = fee.maxPriorityFeePerGas && fee.maxPriorityFeePerGas > 0n ? fee.maxPriorityFeePerGas : gwei(1);
       maxFee = (fee.maxFeePerGas ?? gwei(50)) * BigInt(args.bump) / 100n;
-      console.log(`gas       : auto fell back to rpc suggestion (tip ${ethers_exports.formatUnits(tip, "gwei")} gwei)`);
+      console.log(`gas       : auto fell back to rpc suggestion (tip ${gweiStr(tip)})`);
     }
   }
   if (maxFee <= tip) maxFee = tip * 2n;
+  if (gasLimit * maxFee + value > balance) {
+    const affordable = balance > value ? (balance - value) / gasLimit : 0n;
+    console.log(`gas       : maxFee ${gweiStr(maxFee)} on gasLimit ${gasLimit} needs a ${ron(gasLimit * maxFee + value)} guarantee, wallet holds ${ron(balance)}`);
+    if (affordable <= baseNow) {
+      throw new Error(
+        `balance ${ron(balance)} only allows maxFee ${gweiStr(affordable)} at gasLimit ${gasLimit}, which is below the current baseFee ${gweiStr(baseNow)} \u2014 the tx could never be mined. Top up RON or lower --gas (currently ${gasLimit}).`
+      );
+    }
+    if (affordable <= tip) {
+      throw new Error(
+        `balance ${ron(balance)} allows at most ${gweiStr(affordable)} of maxFee at gasLimit ${gasLimit}, which cannot carry the ${gweiStr(tip)} tip you asked for. Lower --tip/--tip-boost or lower --gas.`
+      );
+    }
+    maxFee = affordable;
+    if (tip >= maxFee) tip = maxFee / 2n;
+    console.log(`gas       : clamped to maxFee ${gweiStr(maxFee)} / tip ${gweiStr(tip)} so the wallet can cover it`);
+  }
   const nonce = await anyPool((p) => p.getTransactionCount(address, "pending"), "getNonce");
   const signed2 = await signer.signTransaction({
     ...txFields,
@@ -27757,10 +27814,17 @@ async function fireRaw(signer, address, txFields) {
     maxPriorityFeePerGas: tip
   });
   const hash2 = ethers_exports.keccak256(signed2);
-  await Promise.allSettled(pool.map((p) => p.send("eth_sendRawTransaction", [signed2])));
-  console.log(`tx sent    : ${hash2} (broadcast to ${pool.length} endpoints)`);
-  const rc = await waitReceipt(hash2, 18e4);
-  return { rc, hash: hash2 };
+  const results = await Promise.allSettled(pool.map((p) => p.send("eth_sendRawTransaction", [signed2])));
+  const accepted = results.filter((r) => r.status === "fulfilled").length;
+  if (accepted === 0) {
+    const why = [...new Set(results.map((r) => r.status === "rejected" ? rawErr(r.reason) : "").filter(Boolean))];
+    console.log(`tx REJECTED: all ${pool.length} endpoints refused the raw tx \u2014 nothing was broadcast`);
+    for (const w of why.slice(0, 3)) console.log(`             ${w}`);
+    return { rc: null, hash: hash2, rejected: true, dropped: false };
+  }
+  console.log(`tx sent    : ${hash2} (accepted by ${accepted}/${pool.length} endpoints)`);
+  const { rc, dropped } = await waitReceipt(hash2, 18e4);
+  return { rc, hash: hash2, rejected: false, dropped };
 }
 async function main() {
   const rpcUrls = await selectPrimary();
@@ -27835,7 +27899,18 @@ async function main() {
   if (args.selfTest) {
     if (!signer) throw new Error("--self-test sends a real (tiny) tx and needs a key: fill MINT_PK in .env");
     console.log("self-test  : firing a 0-RON self-transfer through the real fire path ...");
-    const { rc, hash: hash2 } = await fireRaw(signer, address, { to: address, value: 0n, gasLimit: 21000n });
+    const fired = await fireRaw(signer, address, { to: address, value: 0n, gasLimit: 21000n });
+    if (fired.rejected) {
+      console.log("SELF-TEST \u2717 : every endpoint refused the tx (reason above) \u2014 nothing was sent");
+      process.exitCode = 1;
+      return;
+    }
+    if (fired.dropped) {
+      console.log("SELF-TEST \u2717 : the tx never reached any mempool");
+      process.exitCode = 1;
+      return;
+    }
+    const { rc, hash: hash2 } = fired;
     if (!rc) {
       console.log(`no receipt \u2014 check https://app.roninchain.com/tx/${hash2}`);
       return;
@@ -27917,7 +27992,17 @@ stopped before firing: ${reason2} (${STOP_HINT[reason2]}) \u2014 retrying cannot
       console.log("(dry-run: would broadcast now)");
       return;
     }
-    const { rc, hash: hash2 } = await fireRaw(signer, address, { to: ROUTER, data: calldata, value, gasLimit: args.gas });
+    const fired = await fireRaw(signer, address, { to: ROUTER, data: calldata, value, gasLimit: args.gas });
+    if (fired.rejected) {
+      console.log(`attempt ${attempts}: every endpoint refused the broadcast \u2014 re-pricing and retrying`);
+      await new Promise((r) => setTimeout(r, 1e3));
+      continue;
+    }
+    if (fired.dropped) {
+      console.log(`attempt ${attempts}: tx never entered a mempool \u2014 re-pricing and retrying`);
+      continue;
+    }
+    const { rc, hash: hash2 } = fired;
     if (!rc) {
       console.log(`attempt ${attempts}: no receipt after 180s \u2014 tx may still land; re-checking quota in 5s ...`);
       await new Promise((r) => setTimeout(r, 5e3));
