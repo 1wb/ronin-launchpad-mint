@@ -4,11 +4,15 @@ Ronin Launchpad 白名单场次直连合约 mint 工具(默认配置为 Yakkamon
 
 > ⚠️ 免责声明:仅供个人已获白名单额度的 mint 使用,请遵守 Ronin/项目方条款。私钥只在本机内存中使用,作者不对任何损失负责。
 
-## 小白三步上手(Windows)
+## 小白三步上手
 
-1. 安装 [Node.js LTS](https://nodejs.org/)(一路下一步);
-2. 下载本仓库(绿色 Code → Download ZIP,解压);
-3. **双击 `start.bat`**(macOS/Linux: `bash start.sh`),按提示粘贴私钥、选模式:
+1. 安装 [Node.js LTS](https://nodejs.org/)(一路下一步;macOS/Linux 用系统包管理器或官网安装包);
+2. 从 **[Releases 页面](https://github.com/1wb/ronin-launchpad-mint/releases)** 下载最新版 zip 并解压(内置免安装单文件,无需 `npm install`;也可绿色 Code → Download ZIP 自行下载源码);
+3. 启动:
+   - **Windows**:双击 `start.bat`;
+   - **macOS / Linux**:终端执行 `bash start.sh`(或 `chmod +x start.sh` 后双击);
+
+   按提示粘贴私钥、选模式:
    - `[1] 试跑` = 只读模拟,不发交易,验证一切正常;
    - `[2] 实弹` = 到点自动开火(会花 gas,约 0.007 RON)。
 
